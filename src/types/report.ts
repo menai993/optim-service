@@ -2,21 +2,20 @@
 // Shared types for the report layer
 
 import { ScoredRecommendation } from './scoring';
+import { DiscussionRound, Finding } from './agents';
 
-export type ReportMode = 'full' | 'summary' | 'json';
+export type ReportMode = 'sql_only' | 'backend_only' | 'combined';
 
 export interface OptimizationReport {
-  /** ISO timestamp of report generation */
+  id: string;
   generatedAt: string;
-  /** Short title / project name */
-  title: string;
   mode: ReportMode;
-  /** Ordered list of scored recommendations (highest priority first) */
+  appSummary: string;
+  totalFindings: number;
+  criticalFindings: number;
   recommendations: ScoredRecommendation[];
-  /** Executive summary paragraph */
-  summary: string;
-  /** Raw markdown output, set by the formatter */
-  markdown?: string;
-  /** Raw JSON output, set by the formatter */
-  json?: string;
+  quickWins: ScoredRecommendation[];
+  complexBets: ScoredRecommendation[];
+  discussionRounds: DiscussionRound[];
+  rawFindings: Finding[];
 }

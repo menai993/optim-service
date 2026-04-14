@@ -1,60 +1,160 @@
 // tests/fixtures/sample_backend.ts
-// Realistic TypeScript service file with intentional N+1, missing cache,
-// and ORM issues — used as a fixture for parser tests
+// Realistic TypeScript service with intentional performance problems
+// Used as a fixture for code parser and integration tests
 
-import { PrismaClient } from '@prisma/client';
+import { Repository, Entity, PrimaryGeneratedColumn, Column, ManyToOne, OneToMany } from 'typeorm';
 
-const prisma = new PrismaClient();
+// ── Entities ──────────────────────────────────────────────────────────────────
 
-// ---- N+1 issue: fetching order items inside a loop ----
-export async function getOrdersWithItems(userId: number) {
-  const orders = await prisma.orders.findMany({
-    where: { user_id: userId },
-  });
+@Entity()
+class User {
+  @PrimaryGeneratedColumn('uuid')
+  id!: string;
 
-  // N+1: one DB call per order
-  for (const order of orders) {
-    const items = await prisma.order_items.findMany({
-      where: { order_id: order.id },
-    });
-    (order as typeof order & { items: typeof items }).items = items;
+  @Column()
+  email!: string;
+
+  @OneToMany(() => Order, (order) => order.user, { lazy: true })
+  orders!: Promise<Order[]>;
+}
+
+@Entity()
+class Order {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => User, (user) => user.orders)
+  user!: User;
+
+  @Column()
+  status!: string;
+
+  @Column('decimal')
+  total!: number;
+
+  @OneToMany(() => OrderItem, (item) => item.order, { lazy: true })
+  items!: Promise<OrderItem[]>;
+}
+
+@Entity()
+class OrderItem {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => Order, (order) => order.items)
+  order!: Order;
+
+  @ManyToOne(() => Product)
+  product!: Product;
+
+  @Column()
+  quantity!: number;
+
+  @Column('decimal')
+  price!: number;
+}
+
+@Entity()
+class Product {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  name!: string;
+
+  @Column()
+  category!: string;
+
+  @Column('decimal')
+  price!: number;
+
+  @Column()
+  stockCount!: number;
+
+  @Column('text')
+  description!: string;
+}
+
+// ── Repositories (injected) ───────────────────────────────────────────────────
+
+let orderRepo: Repository<Order>;
+let orderItemRepo: Repository<OrderItem>;
+let productRepo: Repository<Product>;
+let userRepo: Repository<User>;
+
+// ── OrderService ──────────────────────────────────────────────────────────────
+
+export class OrderService {
+  /**
+   * PROBLEM: N+1 query pattern.
+   * Fetches all orders, then loops and calls productRepo.findOneBy() for each item.
+   */
+  async getOrdersForUser(userId: string): Promise<any[]> {
+    const orders = await orderRepo.find({ where: { user: { id: userId } } });
+
+    const result = [];
+    for (const order of orders) {
+      const items = await orderItemRepo.find({ where: { order: { id: order.id } } });
+      const enrichedItems = [];
+      for (const item of items) {
+        // N+1: one query per item to fetch the product
+        const product = await productRepo.findOneBy({ id: item.product.id });
+        enrichedItems.push({ ...item, product });
+      }
+      result.push({ ...order, items: enrichedItems });
+    }
+    return result;
   }
 
-  return orders;
-}
+  /**
+   * PROBLEM: No pagination — returns unbounded result set.
+   */
+  async getProductsByCategory(category: string): Promise<Product[]> {
+    // PROBLEM: raw SELECT * with no LIMIT
+    return productRepo.query(`SELECT * FROM products WHERE category = $1`, [category]);
+  }
 
-// ---- Missing cache: product catalogue fetched on every request ----
-export async function getProductCatalogue() {
-  // No caching — this runs a full table scan on every call
-  const products = await prisma.products.findMany();
-  return products;
-}
+  /**
+   * PROBLEM: await inside forEach — should use Promise.all or batch insert.
+   */
+  async processAuditLog(entries: Array<{ entityType: string; entityId: number; payload: any }>): Promise<void> {
+    entries.forEach(async (entry) => {
+      await orderRepo.query(
+        'INSERT INTO audit_log (entity_type, entity_id, changed_at, payload) VALUES ($1, $2, NOW(), $3)',
+        [entry.entityType, entry.entityId, JSON.stringify(entry.payload)],
+      );
+    });
+  }
 
-// ---- Unbounded query: no limit or pagination ----
-export async function getAllAuditLogs(userId: number) {
-  return prisma.audit_logs.findMany({
-    where: { user_id: userId },
-    // Missing: take / skip pagination
-  });
-}
+  /**
+   * PROBLEM: Accesses lazy-loaded relationship in a loop — hidden N+1.
+   */
+  async getUserWithOrders(userId: string): Promise<{ user: User; orderCount: number }> {
+    const user = await userRepo.findOneBy({ id: userId });
+    if (!user) throw new Error('User not found');
 
-// ---- Raw query with string interpolation ----
-export async function searchProducts(keyword: string) {
-  const raw = await prisma.$queryRawUnsafe(
-    `SELECT * FROM products WHERE name ILIKE '%${keyword}%'`,
-  );
-  return raw;
-}
+    // Lazy load triggers a separate query
+    const orders = await user.orders;
+    return { user, orderCount: orders.length };
+  }
 
-// ---- Missing eager loading: N+1 for user lookups ----
-export async function getRecentOrders(limit: number = 50) {
-  const orders = await prisma.orders.findMany({
-    take: limit,
-    orderBy: { created_at: 'desc' },
-  });
+  // ── Clean methods (should NOT trigger false positives) ──────────────────
 
-  return orders.map(async (order) => {
-    const user = await prisma.users.findFirst({ where: { id: order.user_id } });
-    return { ...order, user };
-  });
+  /**
+   * Clean: single query, no loop, no anti-pattern.
+   */
+  async getOrderById(orderId: number): Promise<Order | null> {
+    return orderRepo.findOneBy({ id: orderId });
+  }
+
+  /**
+   * Clean: properly paginated query.
+   */
+  async getRecentOrders(page: number, pageSize: number): Promise<Order[]> {
+    return orderRepo.find({
+      order: { id: 'DESC' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    });
+  }
 }

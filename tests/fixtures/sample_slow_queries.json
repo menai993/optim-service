@@ -1,17 +1,31 @@
-[
-  {
-    "duration_ms": 3421,
-    "query": "SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id WHERE o.status = 'pending' ORDER BY o.created_at DESC",
-    "explain": "Sort (cost=12543.22..12793.22 rows=100000 width=128)\n  ->  Hash Join (cost=1823.00..7543.00 rows=100000 width=128)\n        Hash Cond: (o.user_id = u.id)\n        ->  Seq Scan on orders o (cost=0.00..4321.00 rows=100000 width=96)\n              Filter: ((status)::text = 'pending')\n        ->  Hash (cost=1123.00..1123.00 rows=56000 width=48)\n              ->  Seq Scan on users u (cost=0.00..1123.00 rows=56000 width=48)"
-  },
-  {
-    "duration_ms": 8750,
-    "query": "SELECT oi.*, p.name, p.price FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ANY($1)",
-    "explain": "Hash Join (cost=2.25..98732.00 rows=500000 width=200)\n  Hash Cond: (oi.product_id = p.id)\n  ->  Seq Scan on order_items oi (cost=0.00..78000.00 rows=500000 width=40)\n        Filter: (order_id = ANY ($1))\n  ->  Hash (cost=1.50..1.50 rows=60 width=168)\n        ->  Seq Scan on products p (cost=0.00..1.50 rows=60 width=168)"
-  },
-  {
-    "duration_ms": 1205,
-    "query": "SELECT COUNT(*) FROM audit_logs WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'",
-    "explain": "Aggregate (cost=18432.00..18432.01 rows=1 width=8)\n  ->  Index Scan using idx_audit_logs_user_id on audit_logs (cost=0.56..18230.00 rows=80800 width=0)\n        Index Cond: (user_id = $1)\n        Filter: (created_at > (now() - '30 days'::interval))"
-  }
-]
+{
+  "pg_stat_statements": [
+    {
+      "query": "SELECT * FROM orders JOIN order_items ON order_items.order_id = orders.id WHERE orders.user_id = $1",
+      "calls": 450,
+      "total_exec_time": 540000,
+      "mean_exec_time": 1200,
+      "min_exec_time": 320,
+      "max_exec_time": 4500,
+      "rows": 225000
+    },
+    {
+      "query": "SELECT * FROM products WHERE category = $1 ORDER BY name",
+      "calls": 2100,
+      "total_exec_time": 1680000,
+      "mean_exec_time": 800,
+      "min_exec_time": 150,
+      "max_exec_time": 3200,
+      "rows": 630000
+    },
+    {
+      "query": "INSERT INTO audit_log (entity_type, entity_id, changed_at, payload) VALUES ($1, $2, NOW(), $3)",
+      "calls": 15000,
+      "total_exec_time": 5100000,
+      "mean_exec_time": 340,
+      "min_exec_time": 80,
+      "max_exec_time": 1800,
+      "rows": 15000
+    }
+  ]
+}

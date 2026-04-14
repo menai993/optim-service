@@ -3,16 +3,23 @@
 
 import { Request, Response, NextFunction } from 'express';
 
-export interface ApiError extends Error {
-  statusCode?: number;
-}
-
 export function errorHandler(
-  err: ApiError,
+  err: Error & { statusCode?: number; agentId?: string },
   _req: Request,
   res: Response,
   _next: NextFunction,
 ): void {
+  // AgentError from specialist agents
+  if (err.name === 'AgentError' && err.agentId) {
+    res.status(500).json({
+      error: {
+        message: err.message,
+        agentId: err.agentId,
+      },
+    });
+    return;
+  }
+
   const statusCode = err.statusCode ?? 500;
   const message = err.message ?? 'Internal Server Error';
 

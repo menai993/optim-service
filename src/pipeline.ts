@@ -1,87 +1,64 @@
 // src/pipeline.ts
 // Main orchestration: wires all agents together end-to-end
 
-import Anthropic from '@anthropic-ai/sdk';
-import { RawInput } from './types/ingestion';
+import { AppContextInput } from './types/ingestion';
+import { Finding, AppContext, DiscussionRound } from './types/agents';
 import { OptimizationReport, ReportMode } from './types/report';
-import { parseSql } from './ingestion/sqlParser';
-import { parseCode } from './ingestion/codeParser';
-import { parseSlowQueryLog } from './ingestion/metricsParser';
-import { buildAppContext } from './agents/contextBuilder';
-import { orchestrate } from './agents/orchestrator';
+import { ingestFiles } from './ingestion';
+import { buildContext } from './agents/contextBuilder';
+import { runSqlSpecialist } from './agents/sqlSpecialist';
+import { runBackendSpecialist } from './agents/backendSpecialist';
+import { runDiscussion } from './discussion/protocol';
+import { runOrchestrator } from './agents/orchestrator';
 import { scoreFindings } from './scoring/engine';
 import { generateReport } from './reports/generator';
-import { attachFormats } from './reports/formatter';
 
 export interface PipelineOptions {
-  title?: string;
   mode?: ReportMode;
-  rounds?: number;
-  model?: string;
+  metadata?: AppContextInput['metadata'];
+  discussionRounds?: number;
 }
 
 /**
- * Run the full optimisation pipeline on a set of raw input files and
- * return a fully-formed OptimizationReport.
+ * Run the full analysis pipeline as a library function (no HTTP).
  */
-export async function runPipeline(
-  client: Anthropic,
-  files: Array<Pick<RawInput, 'filePath' | 'content' | 'type'>>,
+export async function runAnalysisPipeline(
+  files: Array<{ filename: string; content: string }>,
   options: PipelineOptions = {},
 ): Promise<OptimizationReport> {
-  // 1. Ingest
-  const sqlArtifacts = [];
-  const codeArtifacts = [];
+  const mode = options.mode ?? 'combined';
+  const maxRounds = options.discussionRounds ?? 2;
 
-  for (const file of files) {
-    switch (file.type) {
-      case 'sql':
-        sqlArtifacts.push(parseSql(file));
-        break;
-      case 'json':
-        // Assume JSON files may be slow-query logs — try to parse them
-        try {
-          const slowQueries = parseSlowQueryLog(file.content);
-          sqlArtifacts.push({
-            sourceFile: file.filePath,
-            tables: [],
-            indexes: [],
-            migrations: [],
-            slowQueries,
-          });
-        } catch {
-          // Not a slow-query log — skip
-        }
-        break;
-      case 'typescript':
-      case 'javascript':
-        codeArtifacts.push(parseCode(file));
-        break;
-      default:
-        // Try SQL first, then code
-        try {
-          sqlArtifacts.push(parseSql(file));
-        } catch {
-          codeArtifacts.push(parseCode(file));
-        }
-    }
+  // 1. Ingest files
+  const input: AppContextInput = await ingestFiles(files);
+  if (options.metadata) {
+    input.metadata = options.metadata;
   }
 
   // 2. Build context
-  const context = buildAppContext(sqlArtifacts, codeArtifacts);
+  const context: AppContext = await buildContext(input);
 
-  // 3. Run agents
-  const { findings } = await orchestrate(client, context, {
-    model: options.model,
-    rounds: options.rounds ?? 2,
-  });
+  // 3. Run specialists in parallel
+  const [sqlFindings, backendFindings] = await Promise.all([
+    runSqlSpecialist(input, context),
+    runBackendSpecialist(input, context),
+  ]);
 
-  // 4. Score
-  const scored = scoreFindings(findings);
+  // 4. Run discussion
+  const rounds: DiscussionRound[] = await runDiscussion(
+    sqlFindings,
+    backendFindings,
+    context,
+    { maxRounds },
+  );
 
-  // 5. Generate and format report
-  const report = generateReport(scored, options.title ?? 'Optimization Report', options.mode ?? 'full');
-  attachFormats(report);
+  // 5. Run orchestrator with all findings + discussion
+  const allFindings: Finding[] = [...sqlFindings, ...backendFindings];
+  const mergedFindings = await runOrchestrator(allFindings, rounds, context);
 
-  return report;
+  // 6. Score findings
+  const scored = scoreFindings(mergedFindings, context);
+
+  // 7. Generate report
+  return generateReport(scored, rounds, mergedFindings, context, mode);
 }

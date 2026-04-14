@@ -1,25 +1,104 @@
 // src/ingestion/sqlParser.ts
-// Parses SQL schema files, migration files, and slow-query logs
+// Parses SQL schema files, migration files, slow-query logs, and explain plans
 
-import { RawInput, SqlArtifact, TableDefinition, IndexDefinition, SlowQueryEntry } from '../types/ingestion';
+import {
+  SqlArtifact,
+  TableDefinition,
+  ColumnDefinition,
+  ForeignKeyDefinition,
+  IndexDefinition,
+  SlowQuery,
+} from '../types/ingestion';
 
 /**
- * Parse a raw SQL input (schema, migration, or slow-query log) into a
- * structured SqlArtifact.
+ * Detect artifact type from filename pattern.
  */
-export function parseSql(input: RawInput): SqlArtifact {
-  const tables = extractTables(input.content);
-  const indexes = extractIndexes(input.content);
-  const migrations = extractMigrations(input.content);
-  const slowQueries = extractSlowQueries(input.content);
+function detectSqlArtifactType(filename: string): SqlArtifact['type'] {
+  const lower = filename.toLowerCase();
+  if (lower.includes('.migration.') || lower.includes('migrate')) return 'migration';
+  if (lower.includes('index_list') || lower.includes('indexes')) return 'index_list';
+  if (lower.includes('schema')) return 'schema';
+  // Content-based detection is handled in parseSqlFile after reading
+  return 'schema';
+}
 
-  return {
-    sourceFile: input.filePath,
-    tables,
-    indexes,
-    migrations,
-    slowQueries,
+/**
+ * Parse a SQL file into a structured SqlArtifact.
+ */
+export function parseSqlFile(filename: string, content: string): SqlArtifact {
+  // Content-based type detection overrides filename heuristics
+  let type = detectSqlArtifactType(filename);
+
+  const isSlowQueryLog =
+    /duration:\s*\d+(\.\d+)?ms/im.test(content) ||
+    /Query_time:\s*\d/im.test(content);
+
+  const isExplainPlan =
+    /^\s*EXPLAIN/im.test(content) ||
+    /Seq Scan|Index Scan/i.test(content);
+
+  if (isSlowQueryLog) type = 'slow_query_log';
+  else if (isExplainPlan && !content.match(/CREATE\s+TABLE/i)) type = 'explain_plan';
+
+  const artifact: SqlArtifact = {
+    type,
+    filename,
+    rawContent: content,
   };
+
+  if (type === 'explain_plan') {
+    // Store raw; no further structured parsing
+    return artifact;
+  }
+
+  if (type === 'slow_query_log') {
+    artifact.slowQueries = parseSlowQueryLogContent(content);
+    return artifact;
+  }
+
+  // For schema / migration / index_list, parse DDL
+  const tables = extractTables(content);
+  if (tables.length > 0) artifact.parsedTables = tables;
+
+  const indexes = extractIndexes(content);
+  if (indexes.length > 0) artifact.parsedIndexes = indexes;
+
+  return artifact;
+}
+
+/**
+ * Parse slow-query log lines (MySQL / pg style) into SlowQuery[].
+ */
+function parseSlowQueryLogContent(content: string): SlowQuery[] {
+  const results: SlowQuery[] = [];
+
+  // Pattern: "duration: Xms" style (pg)
+  const pgPattern = /duration:\s*([\d.]+)ms\s*(?:.*?)\n\s*(.+)/gim;
+  let match: RegExpExecArray | null;
+  while ((match = pgPattern.exec(content)) !== null) {
+    results.push({
+      duration_ms: parseFloat(match[1]),
+      query: match[2].trim(),
+      calls: 1,
+    });
+  }
+
+  // Pattern: "Query_time: X" style (MySQL slow log)
+  const mysqlPattern = /Query_time:\s*([\d.]+)/gim;
+  const queryAfterMysql = /(?:Query_time:[^\n]*\n)+\s*(.+?)(?:;|$)/gim;
+  if (results.length === 0) {
+    while ((match = mysqlPattern.exec(content)) !== null) {
+      const durationSec = parseFloat(match[1]);
+      const queryMatch = queryAfterMysql.exec(content);
+      results.push({
+        duration_ms: durationSec * 1000,
+        query: queryMatch ? queryMatch[1].trim() : '',
+        calls: 1,
+      });
+    }
+  }
+
+  return results;
 }
 
 /**
@@ -27,18 +106,21 @@ export function parseSql(input: RawInput): SqlArtifact {
  */
 export function extractTables(sql: string): TableDefinition[] {
   const results: TableDefinition[] = [];
-  const createTableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?(\w+)["']?\s*\(([^;]+)\)/gim;
+  const createTableRegex =
+    /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`]?(\w+)["'`]?\s*\(([^;]+)\)/gim;
 
   let match: RegExpExecArray | null;
   while ((match = createTableRegex.exec(sql)) !== null) {
     const tableName = match[1];
     const body = match[2];
-    const ddl = match[0];
+
+    const { columns, primaryKey, foreignKeys } = parseTableBody(body, tableName);
 
     results.push({
       name: tableName,
-      columns: extractColumns(body),
-      ddl,
+      columns,
+      primaryKey,
+      foreignKeys,
     });
   }
 
@@ -46,31 +128,105 @@ export function extractTables(sql: string): TableDefinition[] {
 }
 
 /**
- * Parse column definitions from the body of a CREATE TABLE statement.
+ * Parse the body of a CREATE TABLE to extract columns, PK, and FK constraints.
  */
-function extractColumns(body: string) {
-  return body
-    .split(',')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !/^(PRIMARY|UNIQUE|FOREIGN|CONSTRAINT|INDEX|CHECK)/i.test(line))
-    .map((line) => {
-      const parts = line.split(/\s+/);
-      const name = parts[0].replace(/["'`]/g, '');
-      const dataType = parts[1] ?? 'unknown';
-      const nullable = !/NOT\s+NULL/i.test(line);
-      const isPrimaryKey = /PRIMARY\s+KEY/i.test(line);
-      const isForeignKey = /REFERENCES/i.test(line);
+function parseTableBody(
+  body: string,
+  _tableName: string,
+): {
+  columns: ColumnDefinition[];
+  primaryKey: string[];
+  foreignKeys: ForeignKeyDefinition[];
+} {
+  const columns: ColumnDefinition[] = [];
+  const primaryKey: string[] = [];
+  const foreignKeys: ForeignKeyDefinition[] = [];
 
-      let references: { table: string; column: string } | undefined;
-      if (isForeignKey) {
-        const refMatch = /REFERENCES\s+["']?(\w+)["']?\s*\(\s*["']?(\w+)["']?\s*\)/i.exec(line);
-        if (refMatch) {
-          references = { table: refMatch[1], column: refMatch[2] };
-        }
-      }
+  // Split on commas that are not inside parentheses
+  const parts = splitOnTopLevelCommas(body);
 
-      return { name, dataType, nullable, isPrimaryKey, isForeignKey, references };
+  for (const raw of parts) {
+    const part = raw.trim();
+    if (!part) continue;
+
+    // Standalone PRIMARY KEY constraint
+    const pkMatch = /^PRIMARY\s+KEY\s*\(([^)]+)\)/i.exec(part);
+    if (pkMatch) {
+      pkMatch[1].split(',').forEach((c) => primaryKey.push(c.trim().replace(/["'`]/g, '')));
+      continue;
+    }
+
+    // Standalone FOREIGN KEY constraint
+    const fkMatch =
+      /^(?:CONSTRAINT\s+\w+\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+["'`]?(\w+)["'`]?\s*\(([^)]+)\)/i.exec(
+        part,
+      );
+    if (fkMatch) {
+      foreignKeys.push({
+        column: fkMatch[1].trim().replace(/["'`]/g, ''),
+        referencesTable: fkMatch[2],
+        referencesColumn: fkMatch[3].trim().replace(/["'`]/g, ''),
+      });
+      continue;
+    }
+
+    // Skip other constraints
+    if (/^(UNIQUE|CONSTRAINT|CHECK|INDEX|EXCLUDE)/i.test(part)) continue;
+
+    // Column definition
+    const tokens = part.split(/\s+/);
+    const colName = tokens[0].replace(/["'`]/g, '');
+    const colType = tokens[1] ?? 'unknown';
+    const nullable = !/NOT\s+NULL/i.test(part);
+    const isInlinePK = /PRIMARY\s+KEY/i.test(part);
+
+    if (isInlinePK) {
+      primaryKey.push(colName);
+    }
+
+    // Inline REFERENCES (FK)
+    const inlineFkMatch =
+      /REFERENCES\s+["'`]?(\w+)["'`]?\s*\(\s*["'`]?(\w+)["'`]?\s*\)/i.exec(part);
+    if (inlineFkMatch) {
+      foreignKeys.push({
+        column: colName,
+        referencesTable: inlineFkMatch[1],
+        referencesColumn: inlineFkMatch[2],
+      });
+    }
+
+    columns.push({
+      name: colName,
+      type: colType,
+      nullable,
+      hasIndex: false, // will be updated after index parsing
     });
+  }
+
+  return { columns, primaryKey, foreignKeys };
+}
+
+/**
+ * Split a string on commas, but not commas inside parentheses.
+ */
+function splitOnTopLevelCommas(input: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const ch of input) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current);
+  return parts;
 }
 
 /**
@@ -78,14 +234,16 @@ function extractColumns(body: string) {
  */
 export function extractIndexes(sql: string): IndexDefinition[] {
   const results: IndexDefinition[] = [];
-  const indexRegex = /CREATE\s+(UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?(\w+)["']?\s+ON\s+["']?(\w+)["']?\s*\(([^)]+)\)/gim;
+  const indexRegex =
+    /CREATE\s+(UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?["'`]?(\w+)["'`]?\s+ON\s+["'`]?(\w+)["'`]?\s*(?:USING\s+(\w+)\s*)?\(([^)]+)\)/gim;
 
   let match: RegExpExecArray | null;
   while ((match = indexRegex.exec(sql)) !== null) {
     const isUnique = Boolean(match[1]);
     const indexName = match[2];
     const tableName = match[3];
-    const columnList = match[4]
+    const indexType = match[4] ?? 'btree';
+    const columnList = match[5]
       .split(',')
       .map((c) => c.trim().replace(/["'`]/g, ''));
 
@@ -93,8 +251,8 @@ export function extractIndexes(sql: string): IndexDefinition[] {
       name: indexName,
       table: tableName,
       columns: columnList,
+      type: indexType,
       isUnique,
-      ddl: match[0],
     });
   }
 
@@ -102,34 +260,28 @@ export function extractIndexes(sql: string): IndexDefinition[] {
 }
 
 /**
- * Extract migration statements (ALTER TABLE, DROP, etc.).
+ * Enrich columns with hasIndex based on parsed indexes.
  */
-export function extractMigrations(sql: string): string[] {
-  const migrationRegex = /^\s*(ALTER\s+TABLE|DROP\s+TABLE|RENAME\s+TABLE)[^;]+;/gim;
-  const results: string[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = migrationRegex.exec(sql)) !== null) {
-    results.push(match[0].trim());
-  }
-  return results;
-}
-
-/**
- * Extract slow query entries from a JSON slow-query log embedded in the SQL
- * file content, or return an empty array if none are found.
- */
-export function extractSlowQueries(content: string): SlowQueryEntry[] {
-  try {
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed)) {
-      return parsed.map((entry: Record<string, unknown>) => ({
-        durationMs: Number(entry['duration_ms'] ?? entry['durationMs'] ?? 0),
-        query: String(entry['query'] ?? ''),
-        explainOutput: entry['explain'] != null ? String(entry['explain']) : undefined,
-      }));
+export function enrichColumnsWithIndexInfo(
+  tables: TableDefinition[],
+  indexes: IndexDefinition[],
+): void {
+  const indexedCols = new Set<string>();
+  for (const idx of indexes) {
+    for (const col of idx.columns) {
+      indexedCols.add(`${idx.table}.${col}`);
     }
-  } catch {
-    // Not JSON — not a slow-query log file
   }
-  return [];
+  for (const table of tables) {
+    for (const col of table.columns) {
+      if (indexedCols.has(`${table.name}.${col.name}`)) {
+        col.hasIndex = true;
+      }
+    }
+    // PK columns are implicitly indexed
+    for (const pkCol of table.primaryKey) {
+      const col = table.columns.find((c) => c.name === pkCol);
+      if (col) col.hasIndex = true;
+    }
+  }
 }

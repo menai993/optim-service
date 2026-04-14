@@ -1,86 +1,110 @@
 // src/scoring/rubric.ts
-// Effort / impact rubric definitions and scoring logic
+// Effort / impact rubric — deterministic, no LLM calls
 
-import { Finding, FindingLayer } from '../types/agents';
+import { Finding, AppContext } from '../types/agents';
 import { EffortScore, ImpactScore } from '../types/scoring';
 
-interface RubricEntry {
-  layer: FindingLayer;
+// ── Effort labels ─────────────────────────────────────────────────────────────
+
+const EFFORT_LABELS: Record<EffortScore['value'], string> = {
+  1: 'Trivial',
+  2: 'Small',
+  3: 'Moderate',
+  4: 'Significant',
+  5: 'Major',
+};
+
+// ── Impact labels ─────────────────────────────────────────────────────────────
+
+const IMPACT_LABELS: Record<ImpactScore['value'], string> = {
+  1: 'Minimal',
+  2: 'Low',
+  3: 'Moderate',
+  4: 'High',
+  5: 'Critical',
+};
+
+// ── Keyword-to-effort mappings ────────────────────────────────────────────────
+
+interface EffortRule {
   keywords: string[];
-  effortScore: EffortScore;
-  impactScore: ImpactScore;
+  value: EffortScore['value'];
+  reasoning: string;
 }
 
-/**
- * Heuristic rubric entries used to score findings.
- * The first matching entry (by layer + keyword) wins.
- */
-const RUBRIC: RubricEntry[] = [
-  // Index additions — low effort, high impact
-  { layer: 'index', keywords: ['missing index', 'add index', 'create index'], effortScore: 1, impactScore: 5 },
-  { layer: 'index', keywords: ['redundant index', 'duplicate index'], effortScore: 1, impactScore: 2 },
-
-  // Query rewrites — medium effort, high impact
-  { layer: 'query', keywords: ['full table scan', 'seq scan', 'sequential scan'], effortScore: 2, impactScore: 4 },
-  { layer: 'query', keywords: ['n+1', 'n + 1'], effortScore: 3, impactScore: 5 },
-  { layer: 'query', keywords: ['subquery', 'correlated subquery'], effortScore: 2, impactScore: 3 },
-
-  // Schema changes — higher effort
-  { layer: 'schema', keywords: ['partition', 'partitioning'], effortScore: 4, impactScore: 4 },
-  { layer: 'schema', keywords: ['data type', 'column type'], effortScore: 2, impactScore: 2 },
-
-  // Application — caching
-  { layer: 'caching', keywords: ['cache', 'caching', 'redis', 'memcache'], effortScore: 3, impactScore: 4 },
-
-  // ORM
-  { layer: 'orm', keywords: ['select *', 'select all columns', 'unbounded'], effortScore: 1, impactScore: 3 },
-  { layer: 'orm', keywords: ['eager load', 'eager loading', 'include'], effortScore: 2, impactScore: 4 },
-
-  // Application layer
-  { layer: 'application', keywords: ['connection pool', 'pooling'], effortScore: 2, impactScore: 4 },
-  { layer: 'application', keywords: ['synchronous', 'blocking'], effortScore: 3, impactScore: 3 },
+const EFFORT_RULES: EffortRule[] = [
+  // Level 1
+  { keywords: ['add index', 'create index', 'drop index', 'missing index', 'query hint', 'one-line'], value: 1, reasoning: 'Single index or one-line change' },
+  // Level 2
+  { keywords: ['rewrite query', 'cache layer', 'eager', 'lazy', 'select *', 'select all', 'n+1', 'n + 1'], value: 2, reasoning: 'Single query rewrite or ORM flag change' },
+  // Level 3
+  { keywords: ['refactor', 'pagination', 'paginate', 'covering index', 'migration'], value: 3, reasoning: 'Service refactor or migration with covering index' },
+  // Level 4
+  { keywords: ['schema migration', 'multiple tables', 'extract service', 'restructure'], value: 4, reasoning: 'Multi-table schema migration or service extraction' },
+  // Level 5
+  { keywords: ['cross-service', 'architectural', 'data model redesign', 'caching tier', 'new tier'], value: 5, reasoning: 'Cross-service architectural change' },
 ];
 
-const DEFAULT_EFFORT: EffortScore = 3;
-const DEFAULT_IMPACT: ImpactScore = 2;
+// ── Severity base map ─────────────────────────────────────────────────────────
 
-/**
- * Score a finding by matching it against the rubric.
- */
-export function scoreFinding(finding: Finding): { effort: EffortScore; impact: ImpactScore } {
-  const haystack = `${finding.title} ${finding.description}`.toLowerCase();
+const SEVERITY_BASE: Record<Finding['severity'], ImpactScore['value']> = {
+  critical: 5,
+  high: 4,
+  medium: 3,
+  low: 2,
+};
 
-  for (const entry of RUBRIC) {
-    if (entry.layer !== finding.layer) continue;
-    const matches = entry.keywords.some((kw) => haystack.includes(kw));
-    if (matches) {
-      return { effort: entry.effortScore, impact: entry.impactScore };
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export function scoreEffort(finding: Finding): EffortScore {
+  const haystack = `${finding.title} ${finding.description} ${finding.suggestedFix}`.toLowerCase();
+
+  for (const rule of EFFORT_RULES) {
+    if (rule.keywords.some((kw) => haystack.includes(kw))) {
+      return { value: rule.value, label: EFFORT_LABELS[rule.value], reasoning: rule.reasoning };
     }
   }
 
-  // Fall back to layer-level defaults
-  switch (finding.layer) {
-    case 'index':
-      return { effort: 1, impact: 3 };
-    case 'query':
-      return { effort: 2, impact: 3 };
-    case 'schema':
-      return { effort: 3, impact: 3 };
-    case 'caching':
-      return { effort: 3, impact: 3 };
-    case 'orm':
-      return { effort: 2, impact: 2 };
-    case 'application':
-      return { effort: 3, impact: 2 };
-    default:
-      return { effort: DEFAULT_EFFORT, impact: DEFAULT_IMPACT };
-  }
+  // Fallback by layer
+  const fallback: EffortScore['value'] = finding.layer === 'sql' ? 2 : finding.layer === 'backend' ? 3 : 3;
+  return { value: fallback, label: EFFORT_LABELS[fallback], reasoning: 'Default for layer ' + finding.layer };
 }
 
-/**
- * Compute a composite priority score from effort and impact.
- * Higher is better. Formula: impact^2 / effort (scale 0-25).
- */
-export function computePriorityScore(effort: EffortScore, impact: ImpactScore): number {
-  return Math.round((impact * impact) / effort);
+export function scoreImpact(finding: Finding, context: AppContext): ImpactScore {
+  let value = SEVERITY_BASE[finding.severity] as number;
+  const reasons: string[] = [`Base from severity "${finding.severity}": ${value}`];
+
+  // Boost if any affected artifact is a hot table
+  const touchesHotTable = finding.affectedArtifacts.some((a) =>
+    context.hotTables.some((ht) => a.toLowerCase().includes(ht.toLowerCase())),
+  );
+  if (touchesHotTable) {
+    value = Math.min(value + 1, 5);
+    reasons.push('+1 hot table boost');
+  }
+
+  // Reduce if all affected artifacts are cold (not hot) tables
+  const allCold =
+    finding.affectedArtifacts.length > 0 &&
+    finding.affectedArtifacts.every(
+      (a) => !context.hotTables.some((ht) => a.toLowerCase().includes(ht.toLowerCase())),
+    );
+  if (allCold && !touchesHotTable) {
+    value = Math.max(value - 1, 1);
+    reasons.push('-1 cold/secondary table');
+  }
+
+  // Boost if finding touches a critical path
+  const touchesCriticalPath = context.criticalPaths.some((cp) =>
+    finding.affectedArtifacts.some(
+      (a) => cp.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(cp.toLowerCase()),
+    ),
+  );
+  if (touchesCriticalPath) {
+    value = Math.min(value + 1, 5);
+    reasons.push('+1 critical path boost');
+  }
+
+  const clamped = Math.max(1, Math.min(5, value)) as ImpactScore['value'];
+  return { value: clamped, label: IMPACT_LABELS[clamped], reasoning: reasons.join('; ') };
 }
