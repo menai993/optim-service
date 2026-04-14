@@ -100,7 +100,7 @@ export function detectQueryPatterns(source: string): QueryPattern[] {
     }
 
     // Missing cache: repeated identical fetch without caching
-    if (/await\s+fetch\(|await\s+axios\./i.test(line) && !/cache/i.test(line)) {
+    if ((/await\s+fetch\(|await\s+axios\./i.test(line)) && !/cache/i.test(line)) {
       patterns.push({
         line: lineNum,
         snippet: line.trim(),
